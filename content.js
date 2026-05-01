@@ -108,8 +108,11 @@
             return true;
         }).filter(el => extractText(el).length > 0);
 
+        // Newest first: Telegram renders messages chronologically top→bottom
+        // (oldest at top, newest at bottom), so reverse document order puts
+        // the most recent posts at the top of our panel.
         arr.sort((a, b) =>
-            (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1
+            (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? 1 : -1
         );
         return arr;
     }

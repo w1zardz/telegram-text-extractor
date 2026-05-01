@@ -32,6 +32,7 @@ That setting is enforced **client-side** in the Telegram Web UI. The text is sti
 - 📜 **Bulk copy** — every visible message in one click, separated by headers
 - 💾 **Export to `.txt`** — timestamped filename, UTF-8
 - 🎯 **Jump to message** — scroll back to the original post in the chat
+- 🆕 **Newest first** — most recent posts at the top of the panel, no manual sort
 - 🔄 **Auto-rescan** — as you scroll Telegram lazy-loads new messages, the panel refreshes automatically
 - 🌐 **Works on all Telegram Web variants** — `web.telegram.org/k/`, `/a/`, `/z/` and the legacy build
 - 🛡️ **Privacy-first** — 100% local, no network calls, no analytics, no tracking, no remote config
@@ -50,7 +51,7 @@ That setting is enforced **client-side** in the Telegram Web UI. The text is sti
 3. Toggle **Developer mode** on (top-right)
 4. Click **Load unpacked**
 5. Select the `telegram-text-extractor` folder
-6. Open [web.telegram.org](https://web.telegram.org), click the **📋** button in the bottom-right corner
+6. Open [web.telegram.org](https://web.telegram.org). Either click the **📋** button in the bottom-right corner, or click the extension's icon in the browser toolbar — both toggle the panel on the current tab.
 
 ### Option B — Firefox
 
