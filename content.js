@@ -12,8 +12,8 @@
 
     /* ==========================================================
        Stop copy/cut/Ctrl+C events that originate inside our panel
-       from leaking to Telegram's global "copy is disabled"
-       handler, which otherwise plays its deny-toast sound.
+       from leaking to Telegram's global copy handler (which plays
+       its "copying is disabled" deny chime).
        ========================================================== */
     const isFromOurUI = (e) => {
         const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
@@ -30,7 +30,7 @@
         }
     };
     document.addEventListener('copy', swallow, true);
-    document.addEventListener('cut',  swallow, true);
+    document.addEventListener('cut', swallow, true);
     document.addEventListener('paste', swallow, true);
     document.addEventListener('keydown', (e) => {
         if (!(e.ctrlKey || e.metaKey)) return;
@@ -80,8 +80,7 @@
     const $close   = panel.querySelector('#tge-close');
 
     /* ==========================================================
-       Message discovery — multi-selector strategy
-       Covers all known Telegram Web variants (K, A, Z, legacy).
+       Selectors
        ========================================================== */
     const MSG_SELECTORS = [
         '[data-mid]',
@@ -91,137 +90,243 @@
         '[id^="message-"]'
     ];
 
+    // Narrow text-content selectors — kept tight on purpose so we
+    // don't pick up voice/video/sticker meta blocks.
+    const TEXT_CONTAINER_SEL = [
+        '.translatable-message',
+        '.MessageText',
+        '.Message__text',
+        '.message > .text-content > div'
+    ].join(', ');
+
+    const NOISE_STRIP_SEL = [
+        '.time', '.time-inner', '.MessageMeta', '.message-time',
+        '.reactions', '.Reactions', '.ReactionStaticEmoji',
+        '.post-views', '.views', '.message-views',
+        '.edited', '.is-edited',
+        '.reply-markup', '.RippleEffect', '.ripple-container',
+        '.show-more', '.show-more-button', '.translation-button',
+        '.message-comments', '.CommentsButton', '.comments',
+        '.bot-keyboard',
+        'button', '.btn-icon', '.Button',
+        '.tge-copy-btn'
+    ].join(',');
+
+    /* ==========================================================
+       Helpers
+       ========================================================== */
+    function findTextContainer(bubble) {
+        return bubble.querySelector(TEXT_CONTAINER_SEL);
+    }
+
+    function extractText(bubble) {
+        const textEl = findTextContainer(bubble);
+        if (!textEl) return '';
+        const clone = textEl.cloneNode(true);
+        clone.querySelectorAll(NOISE_STRIP_SEL).forEach(n => n.remove());
+        let txt = (clone.innerText || clone.textContent || '')
+            .replace(/ /g, ' ')
+            .replace(/\s+\n/g, '\n')
+            .trim();
+        // Drop trailing "Show more" / "Развернуть"
+        txt = txt.replace(/[\s·…]+(Show\s+more|Развернуть|Показать\s+ещё|Показать\s+полностью)\.?$/i, '').trim();
+        // Drop trailing "X Comments" tail seen on channel posts
+        txt = txt.replace(/\s*\d+\s+Comments?\s*$/i, '').trim();
+        return txt;
+    }
+
+    function extractTime(bubble) {
+        const t = bubble.querySelector('.time, .time-inner, .MessageMeta time, .message-time');
+        if (!t) return '';
+        const raw = t.innerText || t.textContent || '';
+        return raw.trim().split('\n')[0];
+    }
+
+    function extractMid(bubble) {
+        if (bubble.dataset) {
+            const v = bubble.dataset.mid || bubble.dataset.messageId;
+            if (v) {
+                const n = parseInt(String(v).replace(/[^0-9-]/g, ''), 10);
+                if (!Number.isNaN(n) && n !== 0) return n;
+            }
+        }
+        if (bubble.id && bubble.id.startsWith('message-')) {
+            const n = parseInt(bubble.id.slice(8), 10);
+            if (!Number.isNaN(n) && n !== 0) return n;
+        }
+        return 0;
+    }
+
     function findMessages() {
         const set = new Set();
         for (const sel of MSG_SELECTORS) {
-            try {
-                document.querySelectorAll(sel).forEach(el => set.add(el));
-            } catch (_) {}
+            try { document.querySelectorAll(sel).forEach(el => set.add(el)); } catch (_) {}
         }
-
         const arr = [...set].filter(el => {
+            // De-dupe nested matches.
             let p = el.parentElement;
             while (p) {
                 if (set.has(p) && p !== el) return false;
                 p = p.parentElement;
             }
             return true;
-        }).filter(el => extractText(el).length > 0);
+        });
 
-        // Newest first: Telegram renders messages chronologically top→bottom
-        // (oldest at top, newest at bottom), so reverse document order puts
-        // the most recent posts at the top of our panel.
-        arr.sort((a, b) =>
-            (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? 1 : -1
-        );
-        return arr;
+        const items = [];
+        const seenMids = new Set();
+        for (const el of arr) {
+            const mid = extractMid(el);
+            if (!mid) continue;            // service / date divider — skip
+            if (seenMids.has(mid)) continue; // K and Z builds sometimes both match
+            const text = extractText(el);
+            if (!text) continue;            // voice / video / sticker / GIF — no text container
+            seenMids.add(mid);
+            items.push({ el, mid, text, time: extractTime(el) });
+        }
+
+        // Newest first by Telegram message ID.
+        items.sort((a, b) => b.mid - a.mid);
+        return items;
     }
 
-    function extractText(el) {
-        const clone = el.cloneNode(true);
-        clone.querySelectorAll([
-            '.time', '.time-inner', '.MessageMeta', '.message-time',
-            '.reactions', '.Reactions', '.ReactionStaticEmoji',
-            '.post-views', '.views', '.message-views',
-            '.edited', '.is-edited',
-            '.reply-markup', '.RippleEffect', '.ripple-container',
-            'button', '.btn-icon', '.Button',
-            '.tge-copy-btn'
-        ].join(',')).forEach(n => n.remove());
-        return (clone.innerText || clone.textContent || '')
-            .replace(/ /g, ' ')
-            .replace(/\s+\n/g, '\n')
-            .trim();
+    /* ==========================================================
+       Show-more / "Развернуть" expander — clicked before each scan
+       so long posts (> ~500 chars) reveal their full text instead
+       of the truncated "Кр…" preview.
+       ========================================================== */
+    function clickIfShowMore(btn) {
+        if (!btn) return false;
+        const t = (btn.textContent || '').trim().toLowerCase();
+        const looksLike = /^(show\s+more|показать\s+ещё|показать\s+больше|показать\s+полностью|развернуть(\s+пост)?)\.?$/.test(t);
+        const classHit = btn.classList.contains('show-more') || btn.classList.contains('show-more-button');
+        if (!looksLike && !classHit) return false;
+        try { btn.click(); return true; } catch (_) { return false; }
     }
 
-    function extractTime(el) {
-        const t = el.querySelector('.time, .time-inner, .MessageMeta time, .message-time');
-        return t ? t.innerText.trim().split('\n')[0] : '';
+    function expandAllShowMore() {
+        let count = 0;
+        document.querySelectorAll(
+            '.show-more-button, .show-more, ' +
+            '.bubble .translatable-message button, .Message .MessageText button'
+        ).forEach(btn => { if (clickIfShowMore(btn)) count++; });
+        return count;
+    }
+
+    /* ==========================================================
+       Telegram media silencer — while our panel is open, every
+       <audio>/<video> on the page is paused proactively. This kills
+       the "channel voice message blasts at 100% volume the second
+       you click the extension icon" bug regardless of which
+       Telegram code path triggered the play.
+       ========================================================== */
+    let silencerTimer = 0;
+    function silenceMediaOnce() {
+        try {
+            document.querySelectorAll('audio, video').forEach(m => {
+                try { if (!m.paused) m.pause(); } catch (_) {}
+            });
+        } catch (_) {}
+    }
+    function startSilencer() {
+        if (silencerTimer) return;
+        silenceMediaOnce();
+        silencerTimer = setInterval(silenceMediaOnce, 800);
+    }
+    function stopSilencer() {
+        if (silencerTimer) { clearInterval(silencerTimer); silencerTimer = 0; }
     }
 
     /* ==========================================================
        Render
        ========================================================== */
     let currentPosts = [];
+    let renderInFlight = false;
 
-    function render() {
-        const messages = findMessages();
-        currentPosts = messages
-            .map(el => ({ el, text: extractText(el), time: extractTime(el) }))
-            .filter(p => p.text.length > 0);
+    async function render() {
+        if (renderInFlight) return;
+        renderInFlight = true;
+        try {
+            const expanded = expandAllShowMore();
+            if (expanded > 0) {
+                // Wait for Telegram to fetch and paint the full text.
+                await new Promise(r => setTimeout(r, 600));
+                silenceMediaOnce();
+            }
+            currentPosts = findMessages();
 
-        $count.textContent = currentPosts.length;
+            $count.textContent = currentPosts.length;
 
-        if (currentPosts.length === 0) {
-            $list.innerHTML = `
-                <div class="tge-empty">
-                    No text messages found.<br><br>
-                    Open the chat or channel, scroll until the posts you need are
-                    on screen, then hit <b>↻</b>.<br><br>
-                    <small style="color:#666">Telegram only renders visible messages —
-                    scroll up/down to load older history.</small>
-                </div>`;
-            return;
+            if (currentPosts.length === 0) {
+                $list.innerHTML = `
+                    <div class="tge-empty">
+                        No text messages found.<br><br>
+                        Open the chat or channel, scroll until the posts you need
+                        are on screen, then hit <b>↻</b>.<br><br>
+                        <small style="color:#666">Telegram only renders visible
+                        messages — scroll up/down to load older history.</small>
+                    </div>`;
+                return;
+            }
+
+            const frag = document.createDocumentFragment();
+            currentPosts.forEach((p, i) => {
+                const item = document.createElement('div');
+                item.className = 'tge-item';
+
+                const meta = document.createElement('div');
+                meta.className = 'tge-item-meta';
+                const left = document.createElement('span');
+                left.textContent = `#${i + 1}${p.time ? ' · ' + p.time : ''}`;
+                const right = document.createElement('span');
+                right.textContent = `${p.text.length} chars`;
+                meta.append(left, right);
+
+                const textEl = document.createElement('div');
+                textEl.className = 'tge-item-text';
+                textEl.textContent = p.text;
+
+                const actions = document.createElement('div');
+                actions.className = 'tge-item-actions';
+                const jumpBtn = document.createElement('button');
+                jumpBtn.textContent = '→ Jump';
+                const copyBtn = document.createElement('button');
+                copyBtn.textContent = '📋 Copy';
+                actions.append(jumpBtn, copyBtn);
+
+                item.append(meta, textEl, actions);
+
+                jumpBtn.addEventListener('click', () => {
+                    p.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    const orig = p.el.style.backgroundColor;
+                    p.el.style.transition = 'background .3s';
+                    p.el.style.backgroundColor = 'rgba(36,129,204,.25)';
+                    setTimeout(() => { p.el.style.backgroundColor = orig; }, 800);
+                });
+
+                copyBtn.addEventListener('click', async () => {
+                    const ok = await writeClipboard(p.text);
+                    copyBtn.textContent = ok ? '✓ Copied' : '✗ Failed';
+                    copyBtn.classList.toggle('ok', ok);
+                    setTimeout(() => {
+                        copyBtn.textContent = '📋 Copy';
+                        copyBtn.classList.remove('ok');
+                    }, 1000);
+                });
+
+                frag.appendChild(item);
+            });
+
+            $list.innerHTML = '';
+            $list.appendChild(frag);
+        } finally {
+            renderInFlight = false;
         }
-
-        const frag = document.createDocumentFragment();
-        currentPosts.forEach((p, i) => {
-            const item = document.createElement('div');
-            item.className = 'tge-item';
-
-            const meta = document.createElement('div');
-            meta.className = 'tge-item-meta';
-            const left = document.createElement('span');
-            left.textContent = `#${i + 1}${p.time ? ' · ' + p.time : ''}`;
-            const right = document.createElement('span');
-            right.textContent = `${p.text.length} chars`;
-            meta.append(left, right);
-
-            const textEl = document.createElement('div');
-            textEl.className = 'tge-item-text';
-            textEl.textContent = p.text;
-
-            const actions = document.createElement('div');
-            actions.className = 'tge-item-actions';
-            const jumpBtn = document.createElement('button');
-            jumpBtn.className = 'tge-jump';
-            jumpBtn.textContent = '→ Jump';
-            const copyBtn = document.createElement('button');
-            copyBtn.className = 'tge-copy';
-            copyBtn.textContent = '📋 Copy';
-            actions.append(jumpBtn, copyBtn);
-
-            item.append(meta, textEl, actions);
-
-            jumpBtn.addEventListener('click', () => {
-                p.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                const orig = p.el.style.backgroundColor;
-                p.el.style.transition = 'background .3s';
-                p.el.style.backgroundColor = 'rgba(36,129,204,.25)';
-                setTimeout(() => { p.el.style.backgroundColor = orig; }, 800);
-            });
-
-            copyBtn.addEventListener('click', async () => {
-                const ok = await writeClipboard(p.text);
-                copyBtn.textContent = ok ? '✓ Copied' : '✗ Failed';
-                copyBtn.classList.toggle('ok', ok);
-                setTimeout(() => {
-                    copyBtn.textContent = '📋 Copy';
-                    copyBtn.classList.remove('ok');
-                }, 1000);
-            });
-
-            frag.appendChild(item);
-        });
-
-        $list.innerHTML = '';
-        $list.appendChild(frag);
     }
 
     /* ==========================================================
        Top-bar actions
        ========================================================== */
-    $refresh.addEventListener('click', render);
+    $refresh.addEventListener('click', () => render());
 
     $copyAll.addEventListener('click', async () => {
         if (!currentPosts.length) return;
@@ -257,18 +362,22 @@
         panel.classList.add('open');
         toggleBtn.classList.add('active');
         toggleBtn.textContent = '✕';
-        render();
+        startSilencer();
+        // Let the slide-in animation start before scanning, so a
+        // fresh layout pass runs once and not in the middle of our DOM work.
+        setTimeout(render, 80);
     }
     function closePanel() {
         panel.classList.remove('open');
         toggleBtn.classList.remove('active');
         toggleBtn.textContent = '📋';
+        stopSilencer();
     }
     toggleBtn.addEventListener('click', () => {
         panel.classList.contains('open') ? closePanel() : openPanel();
     });
 
-    /* Open the panel when the user clicks the toolbar icon (popup falls back here). */
+    /* Toolbar icon → background SW → here. */
     chrome.runtime?.onMessage?.addListener((msg) => {
         if (msg && msg.type === 'tge-toggle') {
             panel.classList.contains('open') ? closePanel() : openPanel();
@@ -276,20 +385,28 @@
     });
 
     /* ==========================================================
-       Auto-refresh while panel is open (Telegram virtualizes the DOM —
-       scrolling reveals new messages).
+       Auto-refresh observer.  Mutations from inside our own panel
+       are ignored, otherwise rendering would loop on itself.
        ========================================================== */
     let renderDebounce = 0;
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver((mutations) => {
         if (!panel.classList.contains('open')) return;
+        const fromTelegram = mutations.some(m => {
+            let n = m.target;
+            while (n) {
+                if (n === panel || n === toggleBtn) return false;
+                n = n.parentNode;
+            }
+            return true;
+        });
+        if (!fromTelegram) return;
         clearTimeout(renderDebounce);
-        renderDebounce = setTimeout(render, 250);
+        renderDebounce = setTimeout(() => render(), 700);
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
     /* ==========================================================
-       Clipboard write — extension has clipboardWrite permission, so
-       navigator.clipboard works even on pages that block selection.
+       Clipboard write
        ========================================================== */
     async function writeClipboard(text) {
         try {
@@ -313,7 +430,7 @@
     }
 
     console.log(
-        '%c[Telegram Text Extractor]%c loaded. Click the 📋 button bottom-right.',
+        '%c[Telegram Text Extractor v1.0.2]%c loaded.',
         'color:#2481cc;font-weight:bold;font-size:14px',
         'color:inherit'
     );
