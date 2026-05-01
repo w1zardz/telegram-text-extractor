@@ -11,6 +11,38 @@
     window.__tgeLoaded = true;
 
     /* ==========================================================
+       Stop copy/cut/Ctrl+C events that originate inside our panel
+       from leaking to Telegram's global "copy is disabled"
+       handler, which otherwise plays its deny-toast sound.
+       ========================================================== */
+    const isFromOurUI = (e) => {
+        const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
+        for (const el of path) {
+            if (!el || !el.id) continue;
+            if (el.id === 'tge-panel' || el.id === 'tge-toggle') return true;
+        }
+        return false;
+    };
+    const swallow = (e) => {
+        if (isFromOurUI(e)) {
+            e.stopImmediatePropagation();
+            e.stopPropagation();
+        }
+    };
+    document.addEventListener('copy', swallow, true);
+    document.addEventListener('cut',  swallow, true);
+    document.addEventListener('paste', swallow, true);
+    document.addEventListener('keydown', (e) => {
+        if (!(e.ctrlKey || e.metaKey)) return;
+        const k = (e.key || '').toLowerCase();
+        if (k !== 'c' && k !== 'v' && k !== 'x' && k !== 'a') return;
+        if (isFromOurUI(e)) e.stopImmediatePropagation();
+    }, true);
+    document.addEventListener('contextmenu', (e) => {
+        if (isFromOurUI(e)) e.stopImmediatePropagation();
+    }, true);
+
+    /* ==========================================================
        UI build
        ========================================================== */
     const toggleBtn = document.createElement('button');
