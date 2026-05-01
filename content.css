@@ -11,7 +11,7 @@
 
 #tge-panel {
     position: fixed; top: 0; right: 0; bottom: 0;
-    width: 420px; max-width: 95vw; z-index: 2147483645;
+    width: 440px; max-width: 95vw; z-index: 2147483645;
     background: #1c1c1d; color: #e8e8e8;
     box-shadow: -4px 0 24px rgba(0,0,0,.5);
     display: flex; flex-direction: column;
@@ -26,15 +26,101 @@
     background: #232324;
 }
 .tge-title { font-weight: 600; font-size: 14px; }
-.tge-actions { display: flex; gap: 6px; }
-.tge-actions button {
+.tge-actions { display: flex; gap: 6px; align-items: center; }
+.tge-actions > button {
     background: #2c2c2e; color: #e8e8e8; border: 0; border-radius: 6px;
     padding: 6px 10px; font-size: 12px; cursor: pointer;
     transition: background .12s;
 }
-.tge-actions button:hover { background: #3a3a3c; }
-.tge-actions button.primary { background: #2481cc; }
-.tge-actions button.primary:hover { background: #1f74b8; }
+.tge-actions > button:hover { background: #3a3a3c; }
+.tge-actions > button.primary { background: #2481cc; }
+.tge-actions > button.primary:hover { background: #1f74b8; }
+
+.tge-copy-wrap {
+    position: relative;
+    display: flex;
+    gap: 0;
+}
+.tge-copy-wrap > button {
+    background: #2481cc; color: #fff; border: 0;
+    padding: 6px 10px; font-size: 12px; cursor: pointer;
+    transition: background .12s;
+}
+.tge-copy-wrap > button:first-child {
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+    padding-right: 8px;
+}
+.tge-copy-wrap > button:last-child {
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    border-left: 1px solid rgba(255,255,255,.18);
+    padding: 6px 8px;
+}
+.tge-copy-wrap > button:hover { background: #1f74b8; }
+
+.tge-copy-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 200px;
+    background: #2c2c2e;
+    border: 1px solid #3a3a3c;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    padding: 4px;
+    z-index: 2147483647;
+    max-height: 320px;
+    overflow-y: auto;
+}
+.tge-copy-menu[hidden] { display: none; }
+.tge-copy-menu-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 100%;
+    background: transparent;
+    color: #e8e8e8;
+    border: 0;
+    border-radius: 5px;
+    padding: 7px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    text-align: left;
+}
+.tge-copy-menu-item:hover { background: #3a3a3c; }
+.tge-copy-menu-count {
+    color: #888;
+    font-size: 11px;
+    margin-left: 12px;
+}
+
+.tge-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #2c2c2e;
+    background: #1f1f20;
+    max-height: 90px;
+    overflow-y: auto;
+}
+.tge-filters:empty {
+    display: none;
+}
+.tge-chip {
+    background: #2c2c2e;
+    color: #bbb;
+    border: 0;
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .12s, color .12s;
+}
+.tge-chip:hover { background: #3a3a3c; color: #e8e8e8; }
+.tge-chip.active { background: #2481cc; color: #fff; font-weight: 600; }
 
 .tge-list { flex: 1; overflow-y: auto; padding: 8px; }
 .tge-list::-webkit-scrollbar { width: 8px; }
@@ -49,7 +135,9 @@
 .tge-item-meta {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 6px; font-size: 11px; color: #888;
+    gap: 8px;
 }
+.tge-item-meta > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tge-item-text {
     white-space: pre-wrap; word-break: break-word;
     color: #e8e8e8; font-size: 13px;
@@ -69,6 +157,14 @@
     text-align: center; color: #888; padding: 40px 20px; font-size: 13px;
     line-height: 1.6;
 }
+.tge-empty code {
+    background: #2c2c2e;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+.tge-empty a { text-decoration: none; }
+.tge-empty a:hover { text-decoration: underline; }
 
 #tge-panel, #tge-panel * {
     user-select: text !important;

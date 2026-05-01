@@ -1,7 +1,11 @@
-/* Telegram Text Extractor — content script
- * Adds a slide-in panel to web.telegram.org listing every rendered text post.
- * Per-post copy, copy-all, export to .txt. Works in channels/groups where
- * Telegram disables native text selection and copy.
+/* Telegram Text Extractor — content script (Telegram Web K only)
+ *
+ * Targets web.telegram.org/k/ specifically. The K build has a stable
+ * DOM contract we can rely on: every post bubble is `.bubble[data-mid]`,
+ * the actual text lives in `.translatable-message`, reply previews are
+ * wrapped in `.reply`, and date dividers are `.bubbles-date-group__title`.
+ * No more multi-build selector soup — that's what was causing voice
+ * messages, date dividers and reply previews to leak into the list.
  */
 
 (function () {
@@ -10,10 +14,11 @@
     if (window.__tgeLoaded) return;
     window.__tgeLoaded = true;
 
+    const onK = () => location.pathname.startsWith('/k/');
+
     /* ==========================================================
-       Stop copy/cut/Ctrl+C events that originate inside our panel
-       from leaking to Telegram's global copy handler (which plays
-       its "copying is disabled" deny chime).
+       Stop copy/cut/Ctrl+C events from inside our panel from
+       reaching Telegram's "copying is disabled" listener.
        ========================================================== */
     const isFromOurUI = (e) => {
         const path = (typeof e.composedPath === 'function') ? e.composedPath() : [];
@@ -29,8 +34,8 @@
             e.stopPropagation();
         }
     };
-    document.addEventListener('copy', swallow, true);
-    document.addEventListener('cut', swallow, true);
+    document.addEventListener('copy',  swallow, true);
+    document.addEventListener('cut',   swallow, true);
     document.addEventListener('paste', swallow, true);
     document.addEventListener('keydown', (e) => {
         if (!(e.ctrlKey || e.metaKey)) return;
@@ -58,11 +63,16 @@
             <span class="tge-title">📋 Posts (<span id="tge-count">0</span>)</span>
             <div class="tge-actions">
                 <button id="tge-refresh"  title="Refresh">↻</button>
-                <button id="tge-copy-all" class="primary" title="Copy all">Copy all</button>
-                <button id="tge-export"   title="Export .txt">⬇ .txt</button>
-                <button id="tge-close"    title="Close">✕</button>
+                <div class="tge-copy-wrap">
+                    <button id="tge-copy-all" class="primary" title="Copy filtered posts">Copy</button>
+                    <button id="tge-copy-menu-btn" class="primary" title="Copy by day">▾</button>
+                    <div class="tge-copy-menu" id="tge-copy-menu" hidden></div>
+                </div>
+                <button id="tge-export" title="Export filtered to .txt">⬇ .txt</button>
+                <button id="tge-close"  title="Close">✕</button>
             </div>
         </div>
+        <div class="tge-filters" id="tge-filters"></div>
         <div class="tge-list" id="tge-list">
             <div class="tge-empty">
                 Open a channel or chat, scroll through the messages,<br>
@@ -72,152 +82,163 @@
     `;
     document.body.appendChild(panel);
 
-    const $list    = panel.querySelector('#tge-list');
-    const $count   = panel.querySelector('#tge-count');
-    const $refresh = panel.querySelector('#tge-refresh');
-    const $copyAll = panel.querySelector('#tge-copy-all');
-    const $export  = panel.querySelector('#tge-export');
-    const $close   = panel.querySelector('#tge-close');
+    const $list      = panel.querySelector('#tge-list');
+    const $count     = panel.querySelector('#tge-count');
+    const $filters   = panel.querySelector('#tge-filters');
+    const $refresh   = panel.querySelector('#tge-refresh');
+    const $copyAll   = panel.querySelector('#tge-copy-all');
+    const $copyMenuBtn = panel.querySelector('#tge-copy-menu-btn');
+    const $copyMenu  = panel.querySelector('#tge-copy-menu');
+    const $export    = panel.querySelector('#tge-export');
+    const $close     = panel.querySelector('#tge-close');
 
     /* ==========================================================
-       Selectors
+       K-specific selectors
        ========================================================== */
-    const MSG_SELECTORS = [
-        '[data-mid]',
-        '[data-message-id]',
-        '.Message',
-        '.bubble',
-        '[id^="message-"]'
-    ];
-
-    // Narrow text-content selectors — kept tight on purpose so we
-    // don't pick up voice/video/sticker meta blocks.
-    const TEXT_CONTAINER_SEL = [
-        '.translatable-message',
-        '.MessageText',
-        '.Message__text',
-        '.message > .text-content > div'
-    ].join(', ');
-
-    const NOISE_STRIP_SEL = [
-        '.time', '.time-inner', '.MessageMeta', '.message-time',
-        '.reactions', '.Reactions', '.ReactionStaticEmoji',
-        '.post-views', '.views', '.message-views',
-        '.edited', '.is-edited',
-        '.reply-markup', '.RippleEffect', '.ripple-container',
-        '.show-more', '.show-more-button', '.translation-button',
-        '.message-comments', '.CommentsButton', '.comments',
-        '.bot-keyboard',
-        'button', '.btn-icon', '.Button',
-        '.tge-copy-btn'
+    // Reply previews / forwards / link previews — anything we want to
+    // strip before reading the actual message body.
+    const STRIP_BEFORE_TEXT = [
+        '.reply',
+        '.bubble-reply',
+        '.RepliedMessage',
+        '.web-page-preview',
+        '.web-page',
+        '.preview',
+        '.embed',
+        '.forward-name',
+        '.attribution',
+        '.message-comments-wrapper',
+        '.message-comments',
+        '.bubble-comments',
+        '.reactions',
+        '.reactions-element',
+        '.time',
+        '.time-inner',
+        '.post-views',
+        '.message-views',
+        '.bubble-controls',
+        '.show-more',
+        '.show-more-button',
+        '.translation-button',
+        '.RippleEffect',
+        '.ripple-container',
+        'audio',
+        'video',
+        'source',
+        'img',
+        'button',
+        '.btn-icon'
     ].join(',');
 
     /* ==========================================================
        Helpers
        ========================================================== */
-    function findTextContainer(bubble) {
-        return bubble.querySelector(TEXT_CONTAINER_SEL);
-    }
-
     function extractText(bubble) {
-        const textEl = findTextContainer(bubble);
-        if (!textEl) return '';
-        const clone = textEl.cloneNode(true);
-        clone.querySelectorAll(NOISE_STRIP_SEL).forEach(n => n.remove());
-        let txt = (clone.innerText || clone.textContent || '')
-            .replace(/ /g, ' ')
+        const clone = bubble.cloneNode(true);
+        clone.querySelectorAll(STRIP_BEFORE_TEXT).forEach(n => n.remove());
+
+        // After stripping, the actual body is whatever .translatable-message
+        // remains. If none — try the full cleaned clone (covers media-with-caption).
+        let textEl = clone.querySelector('.translatable-message');
+        if (!textEl) {
+            textEl = clone.querySelector('.text-content') || clone;
+        }
+
+        let txt = (textEl.innerText || textEl.textContent || '')
+            .replace(/ /g, ' ')
             .replace(/\s+\n/g, '\n')
+            .replace(/\n{3,}/g, '\n\n')
             .trim();
-        // Drop trailing "Show more" / "Развернуть"
+
         txt = txt.replace(/[\s·…]+(Show\s+more|Развернуть|Показать\s+ещё|Показать\s+полностью)\.?$/i, '').trim();
-        // Drop trailing "X Comments" tail seen on channel posts
         txt = txt.replace(/\s*\d+\s+Comments?\s*$/i, '').trim();
         return txt;
     }
 
     function extractTime(bubble) {
-        const t = bubble.querySelector('.time, .time-inner, .MessageMeta time, .message-time');
-        if (!t) return '';
-        const raw = t.innerText || t.textContent || '';
-        return raw.trim().split('\n')[0];
+        // K renders time as `<i class="time"><i class="time-inner">..views..<span>HH:MM</span></i></i>`.
+        // We want strictly the HH:MM, not the views ("1.6K").
+        const inner = bubble.querySelector('.time-inner, .time');
+        if (!inner) return '';
+        const raw = (inner.innerText || inner.textContent || '');
+        const m = raw.match(/\b\d{1,2}:\d{2}\b/);
+        return m ? m[0] : '';
     }
 
     function extractMid(bubble) {
-        if (bubble.dataset) {
-            const v = bubble.dataset.mid || bubble.dataset.messageId;
-            if (v) {
-                const n = parseInt(String(v).replace(/[^0-9-]/g, ''), 10);
-                if (!Number.isNaN(n) && n !== 0) return n;
-            }
-        }
-        if (bubble.id && bubble.id.startsWith('message-')) {
-            const n = parseInt(bubble.id.slice(8), 10);
-            if (!Number.isNaN(n) && n !== 0) return n;
-        }
-        return 0;
+        const v = bubble.dataset && bubble.dataset.mid;
+        if (!v) return 0;
+        const n = parseInt(String(v).replace(/[^0-9-]/g, ''), 10);
+        return Number.isNaN(n) ? 0 : n;
     }
 
     function findMessages() {
-        const set = new Set();
-        for (const sel of MSG_SELECTORS) {
-            try { document.querySelectorAll(sel).forEach(el => set.add(el)); } catch (_) {}
-        }
-        const arr = [...set].filter(el => {
-            // De-dupe nested matches.
-            let p = el.parentElement;
-            while (p) {
-                if (set.has(p) && p !== el) return false;
-                p = p.parentElement;
-            }
-            return true;
-        });
-
         const items = [];
         const seenMids = new Set();
-        for (const el of arr) {
-            const mid = extractMid(el);
-            if (!mid) continue;            // service / date divider — skip
-            if (seenMids.has(mid)) continue; // K and Z builds sometimes both match
-            const text = extractText(el);
-            if (!text) continue;            // voice / video / sticker / GIF — no text container
+        const groupedBubbles = new Set();
+
+        // Primary path: walk K's date groups, attribute bubbles to their group title.
+        document.querySelectorAll('.bubbles-date-group').forEach(group => {
+            const title = group.querySelector('.bubbles-date-group__title');
+            const date = title ? (title.innerText || title.textContent || '').trim() : '';
+
+            group.querySelectorAll('.bubble[data-mid]').forEach(bubble => {
+                groupedBubbles.add(bubble);
+                if (!isUsableBubble(bubble)) return;
+                const mid = extractMid(bubble);
+                if (!mid || seenMids.has(mid)) return;
+                const text = extractText(bubble);
+                if (!text) return;
+                seenMids.add(mid);
+                items.push({ el: bubble, mid, text, time: extractTime(bubble), date });
+            });
+        });
+
+        // Fallback: bubbles outside any date group.
+        document.querySelectorAll('.bubble[data-mid]').forEach(bubble => {
+            if (groupedBubbles.has(bubble)) return;
+            if (!isUsableBubble(bubble)) return;
+            const mid = extractMid(bubble);
+            if (!mid || seenMids.has(mid)) return;
+            const text = extractText(bubble);
+            if (!text) return;
             seenMids.add(mid);
-            items.push({ el, mid, text, time: extractTime(el) });
-        }
+            items.push({ el: bubble, mid, text, time: extractTime(bubble), date: '' });
+        });
 
         // Newest first by Telegram message ID.
         items.sort((a, b) => b.mid - a.mid);
         return items;
     }
 
-    /* ==========================================================
-       Show-more / "Развернуть" expander — clicked before each scan
-       so long posts (> ~500 chars) reveal their full text instead
-       of the truncated "Кр…" preview.
-       ========================================================== */
-    function clickIfShowMore(btn) {
-        if (!btn) return false;
-        const t = (btn.textContent || '').trim().toLowerCase();
-        const looksLike = /^(show\s+more|показать\s+ещё|показать\s+больше|показать\s+полностью|развернуть(\s+пост)?)\.?$/.test(t);
-        const classHit = btn.classList.contains('show-more') || btn.classList.contains('show-more-button');
-        if (!looksLike && !classHit) return false;
-        try { btn.click(); return true; } catch (_) { return false; }
+    function isUsableBubble(bubble) {
+        // Service messages (joined chat, pinned, etc.) — skip.
+        if (bubble.classList.contains('service')) return false;
+        // Sticker / round video / voice-only — no text container at all.
+        // We don't pre-filter aggressively; extractText returning '' will skip them.
+        return true;
     }
 
+    /* ==========================================================
+       "Show more" expander (Telegram K collapses long posts).
+       ========================================================== */
     function expandAllShowMore() {
         let count = 0;
-        document.querySelectorAll(
-            '.show-more-button, .show-more, ' +
-            '.bubble .translatable-message button, .Message .MessageText button'
-        ).forEach(btn => { if (clickIfShowMore(btn)) count++; });
+        document.querySelectorAll('.show-more, .show-more-button').forEach(btn => {
+            try { btn.click(); count++; } catch (_) {}
+        });
+        document.querySelectorAll('.bubble .translatable-message button').forEach(btn => {
+            const t = (btn.textContent || '').trim().toLowerCase();
+            if (/^(show\s+more|развернуть|показать\s+ещё|показать\s+полностью)\.?$/i.test(t)) {
+                try { btn.click(); count++; } catch (_) {}
+            }
+        });
         return count;
     }
 
     /* ==========================================================
-       Telegram media silencer — while our panel is open, every
-       <audio>/<video> on the page is paused proactively. This kills
-       the "channel voice message blasts at 100% volume the second
-       you click the extension icon" bug regardless of which
-       Telegram code path triggered the play.
+       Telegram media silencer — keeps voice / video from blasting
+       at the moment the user opens the panel.
        ========================================================== */
     let silencerTimer = 0;
     function silenceMediaOnce() {
@@ -230,131 +251,272 @@
     function startSilencer() {
         if (silencerTimer) return;
         silenceMediaOnce();
-        silencerTimer = setInterval(silenceMediaOnce, 800);
+        silencerTimer = setInterval(silenceMediaOnce, 400);
     }
     function stopSilencer() {
         if (silencerTimer) { clearInterval(silencerTimer); silencerTimer = 0; }
     }
 
     /* ==========================================================
-       Render
+       State
        ========================================================== */
     let currentPosts = [];
+    let currentFilter = 'all';   // 'all' or a date label string
     let renderInFlight = false;
 
+    /* ==========================================================
+       Render
+       ========================================================== */
     async function render() {
         if (renderInFlight) return;
         renderInFlight = true;
         try {
-            const expanded = expandAllShowMore();
-            if (expanded > 0) {
-                // Wait for Telegram to fetch and paint the full text.
-                await new Promise(r => setTimeout(r, 600));
-                silenceMediaOnce();
-            }
-            currentPosts = findMessages();
-
-            $count.textContent = currentPosts.length;
-
-            if (currentPosts.length === 0) {
-                $list.innerHTML = `
-                    <div class="tge-empty">
-                        No text messages found.<br><br>
-                        Open the chat or channel, scroll until the posts you need
-                        are on screen, then hit <b>↻</b>.<br><br>
-                        <small style="color:#666">Telegram only renders visible
-                        messages — scroll up/down to load older history.</small>
-                    </div>`;
+            if (!onK()) {
+                renderNotKBanner();
                 return;
             }
 
-            const frag = document.createDocumentFragment();
-            currentPosts.forEach((p, i) => {
-                const item = document.createElement('div');
-                item.className = 'tge-item';
+            const expanded = expandAllShowMore();
+            if (expanded > 0) {
+                await new Promise(r => setTimeout(r, 600));
+                silenceMediaOnce();
+            }
 
-                const meta = document.createElement('div');
-                meta.className = 'tge-item-meta';
-                const left = document.createElement('span');
-                left.textContent = `#${i + 1}${p.time ? ' · ' + p.time : ''}`;
-                const right = document.createElement('span');
-                right.textContent = `${p.text.length} chars`;
-                meta.append(left, right);
+            currentPosts = findMessages();
 
-                const textEl = document.createElement('div');
-                textEl.className = 'tge-item-text';
-                textEl.textContent = p.text;
+            // Reset filter if its label is no longer present.
+            if (currentFilter !== 'all' && !currentPosts.some(p => p.date === currentFilter)) {
+                currentFilter = 'all';
+            }
 
-                const actions = document.createElement('div');
-                actions.className = 'tge-item-actions';
-                const jumpBtn = document.createElement('button');
-                jumpBtn.textContent = '→ Jump';
-                const copyBtn = document.createElement('button');
-                copyBtn.textContent = '📋 Copy';
-                actions.append(jumpBtn, copyBtn);
-
-                item.append(meta, textEl, actions);
-
-                jumpBtn.addEventListener('click', () => {
-                    p.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    const orig = p.el.style.backgroundColor;
-                    p.el.style.transition = 'background .3s';
-                    p.el.style.backgroundColor = 'rgba(36,129,204,.25)';
-                    setTimeout(() => { p.el.style.backgroundColor = orig; }, 800);
-                });
-
-                copyBtn.addEventListener('click', async () => {
-                    const ok = await writeClipboard(p.text);
-                    copyBtn.textContent = ok ? '✓ Copied' : '✗ Failed';
-                    copyBtn.classList.toggle('ok', ok);
-                    setTimeout(() => {
-                        copyBtn.textContent = '📋 Copy';
-                        copyBtn.classList.remove('ok');
-                    }, 1000);
-                });
-
-                frag.appendChild(item);
-            });
-
-            $list.innerHTML = '';
-            $list.appendChild(frag);
+            renderFilters();
+            renderCopyMenu();
+            renderList();
         } finally {
             renderInFlight = false;
         }
     }
 
+    function renderNotKBanner() {
+        currentPosts = [];
+        $count.textContent = '0';
+        $filters.innerHTML = '';
+        $list.innerHTML = `
+            <div class="tge-empty">
+                <strong style="color:#e8e8e8;font-size:14px;">Open Telegram Web K</strong><br><br>
+                This extension only works on <code>/k/</code> — it relies on its
+                exact DOM structure.<br><br>
+                <a href="https://web.telegram.org/k/" style="color:#2481cc;font-weight:600;">
+                    → Switch to web.telegram.org/k/
+                </a>
+            </div>`;
+    }
+
+    function getFilteredPosts() {
+        if (currentFilter === 'all') return currentPosts;
+        return currentPosts.filter(p => p.date === currentFilter);
+    }
+
+    function renderFilters() {
+        $filters.innerHTML = '';
+        if (!currentPosts.length) return;
+
+        // Preserve first-seen order of dates (newest first since posts are sorted desc).
+        const dates = [];
+        const seen = new Set();
+        for (const p of currentPosts) {
+            if (!p.date) continue;
+            if (seen.has(p.date)) continue;
+            seen.add(p.date);
+            dates.push(p.date);
+        }
+
+        if (!dates.length) return;
+
+        const counts = new Map();
+        counts.set('all', currentPosts.length);
+        for (const d of dates) {
+            counts.set(d, currentPosts.filter(p => p.date === d).length);
+        }
+
+        const make = (key, label) => {
+            const chip = document.createElement('button');
+            chip.className = 'tge-chip' + (currentFilter === key ? ' active' : '');
+            chip.textContent = `${label} · ${counts.get(key) || 0}`;
+            chip.addEventListener('click', () => {
+                currentFilter = key;
+                renderFilters();
+                renderList();
+            });
+            $filters.appendChild(chip);
+        };
+
+        make('all', 'All');
+        for (const d of dates) make(d, d);
+    }
+
+    function renderCopyMenu() {
+        $copyMenu.innerHTML = '';
+        const dates = [];
+        const seen = new Set();
+        for (const p of currentPosts) {
+            if (!p.date || seen.has(p.date)) continue;
+            seen.add(p.date);
+            dates.push(p.date);
+        }
+
+        const addItem = (label, scope) => {
+            const item = document.createElement('button');
+            item.className = 'tge-copy-menu-item';
+            const count = scope === 'all'
+                ? currentPosts.length
+                : currentPosts.filter(p => p.date === scope).length;
+            item.innerHTML = `<span>${label}</span><span class="tge-copy-menu-count">${count}</span>`;
+            item.addEventListener('click', async () => {
+                const posts = scope === 'all'
+                    ? currentPosts
+                    : currentPosts.filter(p => p.date === scope);
+                await copyPosts(posts);
+                hideCopyMenu();
+            });
+            $copyMenu.appendChild(item);
+        };
+
+        addItem('All days', 'all');
+        for (const d of dates) addItem(d, d);
+    }
+
+    function showCopyMenu() {
+        $copyMenu.hidden = false;
+        document.addEventListener('click', onDocClickForCopyMenu, true);
+    }
+    function hideCopyMenu() {
+        $copyMenu.hidden = true;
+        document.removeEventListener('click', onDocClickForCopyMenu, true);
+    }
+    function onDocClickForCopyMenu(e) {
+        if ($copyMenu.contains(e.target) || $copyMenuBtn === e.target) return;
+        hideCopyMenu();
+    }
+
+    function renderList() {
+        const filtered = getFilteredPosts();
+        $count.textContent = filtered.length;
+
+        if (filtered.length === 0) {
+            $list.innerHTML = `
+                <div class="tge-empty">
+                    No text messages in this range.<br><br>
+                    Click <b>↻</b> after scrolling, or pick a different day.
+                </div>`;
+            return;
+        }
+
+        const frag = document.createDocumentFragment();
+        filtered.forEach((p, i) => {
+            const item = document.createElement('div');
+            item.className = 'tge-item';
+
+            const meta = document.createElement('div');
+            meta.className = 'tge-item-meta';
+            const left = document.createElement('span');
+            const head = [`#${i + 1}`];
+            if (p.date) head.push(p.date);
+            if (p.time) head.push(p.time);
+            left.textContent = head.join(' · ');
+            const right = document.createElement('span');
+            right.textContent = `${p.text.length} chars`;
+            meta.append(left, right);
+
+            const textEl = document.createElement('div');
+            textEl.className = 'tge-item-text';
+            textEl.textContent = p.text;
+
+            const actions = document.createElement('div');
+            actions.className = 'tge-item-actions';
+            const jumpBtn = document.createElement('button');
+            jumpBtn.textContent = '→ Jump';
+            const copyBtn = document.createElement('button');
+            copyBtn.textContent = '📋 Copy';
+            actions.append(jumpBtn, copyBtn);
+
+            item.append(meta, textEl, actions);
+
+            jumpBtn.addEventListener('click', () => {
+                p.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                const orig = p.el.style.backgroundColor;
+                p.el.style.transition = 'background .3s';
+                p.el.style.backgroundColor = 'rgba(36,129,204,.25)';
+                setTimeout(() => { p.el.style.backgroundColor = orig; }, 800);
+            });
+
+            copyBtn.addEventListener('click', async () => {
+                const ok = await writeClipboard(p.text);
+                copyBtn.textContent = ok ? '✓ Copied' : '✗ Failed';
+                copyBtn.classList.toggle('ok', ok);
+                setTimeout(() => {
+                    copyBtn.textContent = '📋 Copy';
+                    copyBtn.classList.remove('ok');
+                }, 1000);
+            });
+
+            frag.appendChild(item);
+        });
+
+        $list.innerHTML = '';
+        $list.appendChild(frag);
+    }
+
     /* ==========================================================
        Top-bar actions
        ========================================================== */
+    function serializePosts(posts) {
+        return posts
+            .map((p, i) => {
+                const head = [`#${i + 1}`];
+                if (p.date) head.push(p.date);
+                if (p.time) head.push(p.time);
+                return `--- ${head.join(' · ')} ---\n${p.text}`;
+            })
+            .join('\n\n');
+    }
+
+    async function copyPosts(posts) {
+        if (!posts.length) return false;
+        const ok = await writeClipboard(serializePosts(posts));
+        $copyAll.textContent = ok ? '✓ Copied' : '✗ Failed';
+        setTimeout(() => { $copyAll.textContent = 'Copy'; }, 1000);
+        return ok;
+    }
+
     $refresh.addEventListener('click', () => render());
 
     $copyAll.addEventListener('click', async () => {
-        if (!currentPosts.length) return;
-        const text = serializeAll();
-        const ok = await writeClipboard(text);
-        $copyAll.textContent = ok ? '✓ Copied' : '✗ Failed';
-        setTimeout(() => { $copyAll.textContent = 'Copy all'; }, 1000);
+        const posts = getFilteredPosts();
+        await copyPosts(posts);
+    });
+
+    $copyMenuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if ($copyMenu.hidden) showCopyMenu();
+        else hideCopyMenu();
     });
 
     $export.addEventListener('click', () => {
-        if (!currentPosts.length) return;
-        const text = serializeAll();
+        const posts = getFilteredPosts();
+        if (!posts.length) return;
+        const text = serializePosts(posts);
         const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
         const url  = URL.createObjectURL(blob);
-        const a    = document.createElement('a');
+        const tag = currentFilter === 'all' ? 'all' : currentFilter.replace(/\s+/g, '-');
+        const a = document.createElement('a');
         a.href = url;
-        a.download = `tg-posts-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+        a.download = `tg-posts-${tag}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
-
-    function serializeAll() {
-        return currentPosts
-            .map((p, i) => `--- #${i + 1}${p.time ? ' · ' + p.time : ''} ---\n${p.text}`)
-            .join('\n\n');
-    }
 
     $close.addEventListener('click', closePanel);
 
@@ -363,14 +525,13 @@
         toggleBtn.classList.add('active');
         toggleBtn.textContent = '✕';
         startSilencer();
-        // Let the slide-in animation start before scanning, so a
-        // fresh layout pass runs once and not in the middle of our DOM work.
         setTimeout(render, 80);
     }
     function closePanel() {
         panel.classList.remove('open');
         toggleBtn.classList.remove('active');
         toggleBtn.textContent = '📋';
+        hideCopyMenu();
         stopSilencer();
     }
     toggleBtn.addEventListener('click', () => {
@@ -385,8 +546,7 @@
     });
 
     /* ==========================================================
-       Auto-refresh observer.  Mutations from inside our own panel
-       are ignored, otherwise rendering would loop on itself.
+       Auto-refresh observer (ignores mutations from inside our UI)
        ========================================================== */
     let renderDebounce = 0;
     const observer = new MutationObserver((mutations) => {
@@ -430,7 +590,7 @@
     }
 
     console.log(
-        '%c[Telegram Text Extractor v1.0.2]%c loaded.',
+        '%c[Telegram Text Extractor v1.0.3]%c K-only build loaded.',
         'color:#2481cc;font-weight:bold;font-size:14px',
         'color:inherit'
     );
