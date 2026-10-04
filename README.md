@@ -1,6 +1,6 @@
 # Telegram Text Extractor — Copy text from Telegram channels (even when copying is disabled)
 
-> **Browser extension that lets you copy text from Telegram Web channels and groups, including channels and groups where the owner has disabled copying / forwarding / saving content.** Works with `web.telegram.org` (K, A and Z versions). Per-message copy, copy-all, export every visible post to a `.txt` file. **Manifest V3.** No data leaves your browser.
+> **Browser extension that lets you copy text from Telegram Web channels and groups, including channels and groups where the owner has disabled copying / forwarding / saving content.** Supports `web.telegram.org/k/` and `/a/`. Per-message copy, history collection, search, and export to `.txt` / `.json`. **Manifest V3.** No data leaves your browser.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Manifest V3](https://img.shields.io/badge/Manifest-V3-green.svg)](manifest.json)
@@ -29,14 +29,17 @@ That setting is enforced **client-side** in the Telegram Web UI. The text is sti
 ## Features
 
 - 📋 **Copy text from Telegram Web channels even when copy is disabled**
-- 📜 **Bulk copy** — every visible message in one click, separated by headers
+- 📜 **Bulk copy** — collected, filtered messages in one click, separated by headers
 - 💾 **Export to `.txt`** — timestamped filename, UTF-8
+- ▲ **Auto-collect** — scroll older history, expand K's collapsed posts, and keep posts after Telegram removes them from the page
+- 🔎 **Search, length filters and dedupe**; collected posts survive a tab reload
+- 💾 **JSON export** — numeric message ID, date, time, literal text, source URL when identifiable, text links and a DOM forwarding indicator
 - 🎯 **Jump to message** — scroll back to the original post in the chat
 - 🆕 **Newest first** — most recent posts at the top of the panel, no manual sort
 - 🔄 **Auto-rescan** — as you scroll Telegram lazy-loads new messages, the panel refreshes automatically
-- 🌐 **Works on all Telegram Web variants** — `web.telegram.org/k/`, `/a/`, `/z/` and the legacy build
+- 🌐 **Telegram Web K and A** — direct DOM extraction in either client; Z and legacy builds are unsupported
 - 🛡️ **Privacy-first** — 100% local, no network calls, no analytics, no tracking, no remote config
-- 🪶 **Tiny** — ~14 KB total, vanilla JS, zero dependencies, zero external scripts
+- 🪶 **Vanilla JS** — zero runtime dependencies or external scripts
 - 🌗 **Dark UI** that doesn't fight Telegram's theme
 - ⚡ **Manifest V3** — runs on modern Chrome / Edge / Brave / Opera / Vivaldi / Arc
 
@@ -53,6 +56,8 @@ That setting is enforced **client-side** in the Telegram Web UI. The text is sti
 5. Select the `telegram-text-extractor` folder
 6. Open [web.telegram.org](https://web.telegram.org). Either click the **📋** button in the bottom-right corner, or click the extension's icon in the browser toolbar — both toggle the panel on the current tab.
 
+After updating an unpacked extension, click **Reload** in `chrome://extensions`, then refresh the Telegram tab. K and A can require separate logins; the extension neither reads nor transfers sessions. Sign in and open the channel in the client you use.
+
 ### Option B — Firefox
 
 Firefox MV3 support is in progress on a feature branch. For now use the userscript fallback in [`docs/userscript.user.js`](docs/userscript.user.js) with Tampermonkey or Violentmonkey.
@@ -66,10 +71,13 @@ Firefox MV3 support is in progress on a feature branch. For now use the userscri
 3. Click the floating **📋** button in the bottom-right.
 4. The panel slides in. Click **↻** to scan, then either:
    - press **📋 Copy** on a single post,
-   - **Copy all** to grab everything visible,
-   - or **⬇ .txt** to download a `tg-posts-YYYY-MM-DD-HH-MM.txt` file.
+   - **Copy** to grab the collected, filtered posts,
+   - **⬇ .txt** / **⬇ .json** to download the collected, filtered posts,
+   - or **▲ Auto-collect** to walk older history (press **■ Stop** to stop).
 
-To grab a long thread, just scroll up slowly with the panel open — new posts are picked up automatically as Telegram renders them.
+Manual scrolling with the panel open also keeps newly rendered posts. Auto-collect stops after repeated attempts load no older posts; this is not proof that every channel post exists in the export. Retry after a connection failure. The `until` field uses the oldest currently loaded message, rather than cached dates; an unknown date at that boundary stops collection with a message instead of ignoring the cutoff.
+
+K supplies a machine timestamp. A normally exposes a displayed day/time, so JSON retains `ts: 0` and a parsed day when recognized (otherwise the original day label). English, Russian and the browser/page locale are checked. Private-channel `source_url` comes from the channel's numeric route and server message ID; it is `null` for unidentified routes and basic groups. Links in the original message remain in `links`. Text itself remains plain text; the DOM forwarding indicator does not prove who authored the text or identify quoted speakers.
 
 ---
 
@@ -83,13 +91,17 @@ Telegram Web blocks copying with three layers of CSS / JS:
 
 But the message text is still **plain DOM** — the page isn't using a canvas or a screenshot trick. This extension:
 
-- queries every rendered bubble using selectors that cover the K, A and Z builds (`[data-mid]`, `[data-message-id]`, `.Message`, `.bubble`, `[id^="message-"]`),
-- de-duplicates nested matches (so a wrapper isn't counted twice with its child),
+- reads K's `.bubble[data-mid]` or A's `.MessageList .Message[data-message-id]` / `.Message[id^="message-"]`,
+- uses stable numeric server message IDs; K's channel DOM IDs have their `2^32` client offset removed,
 - strips noise nodes (timestamps, reactions, view counts, reply markup, ripple effects),
 - extracts `innerText` and renders it inside the extension's own panel where `user-select` is forced back on,
 - writes to the clipboard via `navigator.clipboard.writeText()` — the extension has the `clipboardWrite` permission, so this works regardless of the page's `copy` listener.
 
 A `MutationObserver` keeps the panel in sync as Telegram virtualizes the message list.
+
+A selectors follow the [official Telegram Web A source](https://github.com/Ajaxy/telegram-tt/tree/28ffcf710b15571e5a2f7bb3bdce3fc90fc8ec80/src/components/middle). Ordinary A message text is already complete in `.text-content`; K's known Show more controls are expanded before scanning. The extension accesses no internal Telegram APIs or account/session databases.
+
+Focused browser-DOM fixtures are in `tests/dom.test.js`. With Playwright available to Node, run `node --test tests/dom.test.js`; `TGE_BROWSER_EXECUTABLE` can select a local Chromium executable. These fixtures verify K/A extraction and history collection; they do not replace a check in an authenticated Telegram tab.
 
 ---
 
@@ -98,6 +110,7 @@ A `MutationObserver` keeps the panel in sync as Telegram virtualizes the message
 | Permission | Why |
 | --- | --- |
 | `clipboardWrite` | To put extracted text on the clipboard. |
+| `storage`, `unlimitedStorage` | To keep the collected plain-text posts locally per chat. |
 | `activeTab` | So the popup can wake the panel on the current Telegram tab. |
 | `scripting` | Reserved for forced re-injection if the content script needs to be reloaded into a long-running tab. |
 | `host_permissions: https://web.telegram.org/*` | Scopes the extension to Telegram Web only — it does **not** run anywhere else on the internet. |
@@ -135,10 +148,11 @@ The extension does not interact with Telegram's API at all. It only reads the DO
 
 - [ ] Firefox MV3 packaging
 - [ ] Markdown export (preserve bold / italic / links / code)
-- [ ] JSON export with sender, timestamp, message ID
-- [ ] Auto-scroll mode that walks the entire channel until the top
-- [ ] Filter / search inside the panel
-- [ ] Per-channel saved exports
+- [x] JSON export with message ID, displayed date/time, source URL and links
+- [x] Auto-scroll collection
+- [x] Filter / search inside the panel
+- [x] Per-chat local collection
+- [ ] Sender attribution in exports
 
 PRs welcome.
 

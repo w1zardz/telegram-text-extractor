@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Telegram Text Extractor — Copy from Protected Channels",
   "short_name": "TG Text Extractor",
-  "version": "1.1.0",
-  "description": "Copy text from Telegram Web channels and groups even when copying is disabled. Auto-collect whole channel history, bulk copy, search, export to .txt / .json.",
+  "version": "1.1.1",
+  "description": "Copy text from Telegram Web K and A even when copying is disabled. Collect channel history, bulk copy, search, export to .txt / .json.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

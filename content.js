@@ -1,6 +1,6 @@
-/* Telegram Text Extractor — content script (Telegram Web K)
+/* Telegram Text Extractor — content script (Telegram Web K / A)
  *
- * Targets web.telegram.org/k/. K has a stable DOM contract: every post
+ * Supports web.telegram.org/k/ and /a/. K's DOM contract: every post
  * bubble is `.bubble[data-mid]` with `data-timestamp`, the text lives in
  * `.translatable-message`, reply previews are wrapped in `.reply`, date
  * dividers are `.bubbles-date-group__title`.
@@ -9,8 +9,10 @@
  * removed from the DOM. So instead of reading "what is visible now" we
  * keep an accumulating per-chat store (persisted in chrome.storage.local)
  * and add an auto-scroll harvester that walks the history on its own.
- * On /a/ and other builds the panel offers a one-click jump to the same
- * chat in /k/.
+ * A selectors follow Ajaxy/telegram-tt, commit 28ffcf710b15571e5a2f7bb3bdce3fc90fc8ec80:
+ * `.Message[data-message-id]`, `.text-content`, `.message-date-group`,
+ * `.sticky-date`, `.MessageMeta`, `.message-time`, `.MessageList.custom-scroll`.
+ * Neither adapter reads Telegram account/session storage or internal APIs.
  */
 
 (function () {
@@ -19,9 +21,23 @@
     if (window.__tgeLoaded) return;
     window.__tgeLoaded = true;
 
-    const VERSION = '1.1.0';
+    const VERSION = '1.1.1';
     const RENDER_LIMIT = 400;          // DOM items in the panel; export always takes everything
     const onK = () => location.pathname.startsWith('/k/');
+    const onA = () => location.pathname.startsWith('/a/');
+    const supported = () => onK() || onA();
+    const MESSAGE_ID_OFFSET = 0x100000000;
+    const messageSelector = () => onA()
+        ? '.Message[data-message-id], .Message[id^="message-"]'
+        : '.bubble[data-mid]';
+    const isRendered = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+    const aMessageList = () => [...document.querySelectorAll('.MessageList.custom-scroll')]
+        .find(isRendered) || null;
+    const kMessageList = () => [...document.querySelectorAll('.bubbles .bubbles-scrollable, .bubbles .scrollable-y')]
+        .find(isRendered) || [...document.querySelectorAll('.bubbles')].find(isRendered) || null;
+    const historyRoot = () => onA() ? aMessageList() : kMessageList();
+    const historyMessages = () => [...(historyRoot()?.querySelectorAll(messageSelector()) || [])]
+        .filter(el => isRendered(el) && !el.closest('.bubbles-remover'));
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     /* ==========================================================
@@ -77,13 +93,13 @@
                     <div class="tge-copy-menu" id="tge-copy-menu" hidden></div>
                 </div>
                 <button id="tge-export" title="Export filtered to .txt">⬇ .txt</button>
-                <button id="tge-export-json" title="Export filtered to .json (mid, date, text)">⬇ .json</button>
+                <button id="tge-export-json" title="Export filtered to .json (mid, date, text, source URL, links)">⬇ .json</button>
                 <button id="tge-close" title="Close">✕</button>
             </div>
         </div>
         <div class="tge-harvest">
-            <button id="tge-auto" class="primary" title="Scroll the chat history automatically and collect every post">▲ Auto-collect</button>
-            <label title="Stop when posts older than this date are reached (empty = go to the very beginning)">
+            <button id="tge-auto" class="primary" title="Scroll older history automatically and keep rendered posts">▲ Auto-collect</button>
+            <label title="Stop when posts older than this date are reached (empty = no date cutoff)">
                 until <input type="date" id="tge-until">
             </label>
             <button id="tge-clear" title="Forget everything collected for this chat">🗑</button>
@@ -125,7 +141,7 @@
     const $dedupe      = $('#tge-dedupe');
 
     /* ==========================================================
-       K-specific selectors
+       DOM noise outside the original message text
        ========================================================== */
     const STRIP_BEFORE_TEXT = [
         '.reply', '.bubble-reply', '.RepliedMessage',
@@ -134,6 +150,7 @@
         '.message-comments-wrapper', '.message-comments', '.bubble-comments',
         '.reactions', '.reactions-element',
         '.time', '.time-inner', '.post-views', '.message-views',
+        '.MessageMeta', '.Reactions', '.translation-animation',
         '.bubble-controls', '.show-more', '.show-more-button', '.translation-button',
         '.RippleEffect', '.ripple-container',
         'audio', 'video', 'source', 'img', 'button', '.btn-icon'
@@ -167,7 +184,18 @@
             const arr = res[storageKey(k)];
             if (!Array.isArray(arr)) return;
             const b = bucket(k);
-            for (const p of arr) if (p && p.mid && !b.has(p.mid)) b.set(p.mid, p);
+            for (const p of arr) {
+                if (!p || !p.mid) continue;
+                // K channel IDs in v1.1.0 were saved with the client's 2^32 offset.
+                const mid = onK() ? serverMid(p.mid) : Number(p.mid);
+                if (!mid) continue;
+                const migrated = {
+                    ...p, mid, dom_mid: p.dom_mid || p.mid,
+                    source_url: p.source_url || sourceUrl(mid, p.dom_mid || p.mid, k),
+                    links: p.links || [], forwarded: p.forwarded ?? null
+                };
+                if (!b.has(mid) || b.get(mid).text.length < migrated.text.length) b.set(mid, migrated);
+            }
         } catch (_) {}
     }
 
@@ -194,10 +222,15 @@
        ========================================================== */
     function extractText(bubble) {
         const clone = bubble.cloneNode(true);
+        // Web A renders unsupported native emoji as img.emoji with the literal alt.
+        clone.querySelectorAll('img.emoji[alt]').forEach(img => img.replaceWith(img.alt));
         clone.querySelectorAll(STRIP_BEFORE_TEXT).forEach(n => n.remove());
 
-        let textEl = clone.querySelector('.translatable-message');
-        if (!textEl) textEl = clone.querySelector('.text-content') || clone;
+        let textEl = onA() ? clone.querySelector('.text-content') : clone.querySelector('.translatable-message');
+        if (!textEl && onK()) textEl = clone.querySelector('.text-content') || clone;
+        if (!textEl) return '';
+        // Detached clones have no layout: innerText otherwise joins <br> lines.
+        textEl.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
 
         let txt = (textEl.innerText || textEl.textContent || '')
             .replace(/ /g, ' ')
@@ -211,20 +244,36 @@
     }
 
     function extractTime(bubble) {
-        const inner = bubble.querySelector('.time-inner, .time');
+        const inner = bubble.querySelector(onA() ? '.message-time' : '.time-inner, .time');
         if (!inner) return '';
-        const m = (inner.innerText || inner.textContent || '').match(/\b\d{1,2}:\d{2}\b/);
+        const m = (inner.innerText || inner.textContent || '').match(/\b\d{1,2}:\d{2}(?:\s*[AP]M)?\b/i);
         return m ? m[0] : '';
     }
 
+    function serverMid(value) {
+        const raw = String(value || '');
+        if (!/^\d+$/.test(raw)) return 0;
+        const n = Number(raw);
+        if (!Number.isSafeInteger(n) || n <= 0 || n >= MESSAGE_ID_OFFSET * 2) return 0;
+        return n > MESSAGE_ID_OFFSET ? n - MESSAGE_ID_OFFSET : n === MESSAGE_ID_OFFSET ? 0 : n;
+    }
+
+    function extractDomMid(bubble) {
+        if (onK()) return bubble.dataset.mid || '';
+        return bubble.dataset.messageId || (/^message-(\d+)$/.exec(bubble.id || '') || [])[1] || '';
+    }
+
     function extractMid(bubble) {
-        const v = bubble.dataset && bubble.dataset.mid;
-        if (!v) return 0;
-        const n = parseInt(String(v).replace(/[^0-9-]/g, ''), 10);
-        return Number.isNaN(n) ? 0 : n;
+        return onK() ? serverMid(extractDomMid(bubble)) : (() => {
+            const raw = extractDomMid(bubble);
+            const n = /^\d+$/.test(raw) ? Number(raw) : 0;
+            return Number.isSafeInteger(n) && n > 0 ? n : 0;
+        })();
     }
 
     function extractTs(bubble) {
+        // A does not expose a machine timestamp in ordinary message markup.
+        if (onA()) return 0;
         const v = bubble.dataset && bubble.dataset.timestamp;
         const n = v ? parseInt(v, 10) : 0;
         return Number.isFinite(n) && n > 0 ? n : 0;
@@ -240,50 +289,125 @@
         return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
     };
 
+    function displayedDay(label) {
+        const normalizeLabel = (value) => String(value).toLocaleLowerCase()
+            .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+        const target = normalizeLabel(label);
+        if (!target) return '';
+        const today = new Date();
+        if (/^(today|сегодня)$/.test(target)) return isoDay(today.getTime() / 1000);
+        if (/^(yesterday|вчера)$/.test(target)) {
+            today.setDate(today.getDate() - 1);
+            return isoDay(today.getTime() / 1000);
+        }
+        const locales = [...new Set([document.documentElement.lang, navigator.language, 'en', 'ru'].filter(Boolean))];
+        for (const locale of locales) {
+            try {
+                // A uses a weekday for the previous six days, month/day this year,
+                // and a full date for older years (formatMessageListDate upstream).
+                const weekday = new Intl.DateTimeFormat(locale, { weekday: 'long' });
+                for (let back = 1; back < 7; back++) {
+                    const day = new Date(); day.setDate(day.getDate() - back);
+                    if (normalizeLabel(weekday.format(day)) === target) return isoDay(day.getTime() / 1000);
+                }
+                const yearMatch = /\b([12]\d{3})\b/.exec(target);
+                const year = yearMatch ? Number(yearMatch[1]) : today.getFullYear();
+                const numbers = target.match(/\b\d{1,4}\b/g) || [];
+                const dayNumber = numbers.find(n => n.length <= 2 && Number(n) >= 1 && Number(n) <= 31);
+                if (!dayNumber) continue;
+                for (let month = 0; month < 12; month++) {
+                    const day = new Date(year, month, Number(dayNumber), 12);
+                    if (day.getMonth() !== month) continue;
+                    const formatter = new Intl.DateTimeFormat(locale, {
+                        day: 'numeric', month: 'long', ...(yearMatch ? { year: 'numeric' } : {})
+                    });
+                    if (normalizeLabel(formatter.format(day)) === target) return isoDay(day.getTime() / 1000);
+                }
+            } catch (_) {}
+        }
+        return ''; // Preserve the label; never invent a timestamp for unknown formats.
+    }
+
+    function sourceUrl(mid, domMid, key = chatKey()) {
+        const peer = onA() ? key.split('_')[0] : key;
+        if (onA()) {
+            if (!/^-\d+$/.test(peer)) return null;
+            const channel = -BigInt(peer) - 1000000000000n; // Telegram Web A CHANNEL_ID_BASE.
+            return channel > 0n ? `https://t.me/c/${channel}/${mid}` : null;
+        }
+        // Only K's offset identifies a channel/supergroup; basic group IDs are ambiguous.
+        if (Number(domMid) <= MESSAGE_ID_OFFSET) return null;
+        if (/^-\d+$/.test(peer)) return `https://t.me/c/${peer.slice(1)}/${mid}`;
+        if (/^@[a-z][a-z0-9_]{3,31}$/i.test(peer)) return `https://t.me/${peer.slice(1)}/${mid}`;
+        return null;
+    }
+
+    function extractLinks(bubble) {
+        const text = bubble.querySelector(onA() ? '.text-content' : '.translatable-message, .text-content');
+        if (!text) return [];
+        const clone = text.cloneNode(true);
+        clone.querySelectorAll(STRIP_BEFORE_TEXT).forEach(n => n.remove());
+        return [...new Set([...clone.querySelectorAll('a[href]')].map(a => a.href)
+            .filter(href => /^https?:\/\//i.test(href)))];
+    }
+
     /** Reads every bubble currently in the DOM into the chat store. Returns how many were new. */
     function harvest() {
+        if (!supported() || !chatKey()) return 0;
         const b = bucket();
         let added = 0;
-        document.querySelectorAll('.bubbles-date-group').forEach(group => {
-            const title = group.querySelector('.bubbles-date-group__title');
-            const label = title ? (title.innerText || title.textContent || '').trim() : '';
-            group.querySelectorAll('.bubble[data-mid]').forEach(bubble => {
-                if (readBubble(bubble, label, b)) added++;
-            });
-        });
-        document.querySelectorAll('.bubble[data-mid]').forEach(bubble => {
-            if (!bubble.closest('.bubbles-date-group') && readBubble(bubble, '', b)) added++;
+        historyMessages().forEach(bubble => {
+            if (readBubble(bubble, messageDayLabel(bubble), b)) added++;
         });
         if (added) scheduleSave();
         return added;
     }
 
+    function messageDayLabel(bubble) {
+        const title = onA()
+            ? bubble.closest('.message-date-group')?.querySelector('.sticky-date')
+            : bubble.closest('.bubbles-date-group')?.querySelector('.bubbles-date-group__title');
+        return title ? (title.innerText || title.textContent || '').trim() : '';
+    }
+
     function readBubble(bubble, label, b) {
-        if (bubble.classList.contains('service')) return false;
+        if (bubble.classList.contains('service') || bubble.classList.contains('ActionMessage')) return false;
         const mid = extractMid(bubble);
         if (!mid) return false;
         const text = extractText(bubble);
         if (!text) return false;
         const prev = b.get(mid);
-        // Keep the longest version — a collapsed post may have been read before "Show more" expanded.
-        if (prev && prev.text.length >= text.length) return false;
         const ts = extractTs(bubble);
-        b.set(mid, {
+        const domMid = Number(extractDomMid(bubble));
+        const post = {
             mid,
-            ts,
-            date: ts ? isoDay(ts) : label,
-            time: ts ? hhmm(ts) : extractTime(bubble),
-            text
-        });
-        return !prev;
+            dom_mid: domMid,
+            ts: ts || prev?.ts || 0,
+            date: ts ? isoDay(ts) : displayedDay(label) || prev?.date || label,
+            time: ts ? hhmm(ts) : extractTime(bubble) || prev?.time || '',
+            text: prev && prev.text.length > text.length ? prev.text : text,
+            source_url: sourceUrl(mid, domMid),
+            links: [...new Set([...(prev?.links || []), ...extractLinks(bubble)])],
+            forwarded: onA() ? !!bubble.querySelector('.message-content.is-forwarded')
+                : !!bubble.querySelector('.forward-name')
+        };
+        if (prev && JSON.stringify(prev) === JSON.stringify(post)) return false;
+        b.set(mid, post);
+        return true; // Also persist expanded text and newly available date/link metadata.
     }
 
     function expandAllShowMore() {
+        // A's ordinary MessageText has no truncateLength; all text is already DOM.
+        if (onA()) return 0;
+        const root = kMessageList();
+        if (!root) return 0;
         let count = 0;
-        document.querySelectorAll('.bubble .show-more, .bubble .show-more-button').forEach(btn => {
+        root.querySelectorAll('.bubble .show-more, .bubble .show-more-button').forEach(btn => {
+            if (!isRendered(btn) || btn.closest('.bubbles-remover')) return;
             try { btn.click(); count++; } catch (_) {}
         });
-        document.querySelectorAll('.bubble .translatable-message button').forEach(btn => {
+        root.querySelectorAll('.bubble .translatable-message button').forEach(btn => {
+            if (!isRendered(btn) || btn.closest('.bubbles-remover')) return;
             const t = (btn.textContent || '').trim();
             if (/^(show\s+more|развернуть|показать\s+ещё|показать\s+полностью)\.?$/i.test(t)) {
                 try { btn.click(); count++; } catch (_) {}
@@ -298,29 +422,40 @@
     let autoRunning = false;
 
     function scroller() {
-        const any = document.querySelector('.bubble[data-mid]');
+        if (onA()) return aMessageList();
+        const root = kMessageList();
+        if (!root) return null;
+        const any = historyMessages()[0];
         let n = any ? any.parentElement : null;
         while (n && n !== document.body) {
             const s = getComputedStyle(n);
             if (/(auto|scroll)/.test(s.overflowY) && n.scrollHeight > n.clientHeight) return n;
+            if (n === root) break;
             n = n.parentElement;
         }
-        return document.querySelector('.bubbles .scrollable-y, .bubbles-inner')?.closest('.scrollable') || null;
+        return root.matches('.scrollable-y') ? root : root.querySelector('.scrollable-y');
     }
 
-    function oldestTsInStore() {
-        let min = Infinity;
-        for (const p of bucket().values()) if (p.ts && p.ts < min) min = p.ts;
-        return min;
+    function oldestVisibleDay() {
+        let frontier = null;
+        let frontierMid = Infinity;
+        for (const bubble of historyMessages()) {
+            if (bubble.classList.contains('service') || bubble.classList.contains('ActionMessage')) continue;
+            const mid = extractMid(bubble);
+            if (mid && mid < frontierMid) { frontier = bubble; frontierMid = mid; }
+        }
+        if (!frontier) return '';
+        const ts = extractTs(frontier);
+        return ts ? isoDay(ts) : displayedDay(messageDayLabel(frontier));
     }
 
     async function autoCollect() {
-        if (!onK()) return;
+        if (!supported()) return;
         autoRunning = true;
         $auto.textContent = '■ Stop';
         $auto.classList.add('danger');
         const key = chatKey();
-        const untilTs = $until.value ? Math.floor(new Date($until.value + 'T00:00:00').getTime() / 1000) : 0;
+        const untilDay = $until.value;
         let idle = 0;
         let rounds = 0;
         const started = bucket().size;
@@ -335,12 +470,17 @@
                 const added = harvest();
                 rounds++;
 
-                const oldest = oldestTsInStore();
+                // Cached dates cannot tell us whether the current older boundary is known.
+                const oldest = oldestVisibleDay();
                 setStatus(`+${bucket().size - started} · ${bucket().size} total` +
-                    (oldest !== Infinity ? ` · back to ${isoDay(oldest)}` : ''));
+                    (oldest ? ` · back to ${oldest}` : ''));
                 if (rounds % 3 === 0) renderSoon();
 
-                if (untilTs && oldest !== Infinity && oldest < untilTs) {
+                if (untilDay && !oldest) {
+                    setStatus('Date unavailable at the oldest loaded post: clear "until" to continue');
+                    break;
+                }
+                if (untilDay && oldest < untilDay) {
                     setStatus(`Reached ${$until.value} · ${bucket().size} total`);
                     break;
                 }
@@ -355,7 +495,7 @@
                 }
                 if (added === 0 && !grew) {
                     idle++;
-                    if (idle >= 6) { setStatus(`Start of history · ${bucket().size} total`); break; }
+                    if (idle >= 6) { setStatus(`No older posts loaded · ${bucket().size} kept`); break; }
                     // Nudge: some loads only trigger after a small scroll movement.
                     sc.scrollTop = 200;
                     await sleep(300);
@@ -445,8 +585,8 @@
         if (renderInFlight) return;
         renderInFlight = true;
         try {
-            if (!onK()) {
-                renderNotKBanner();
+            if (!supported()) {
+                renderUnsupportedBanner();
                 return;
             }
             await loadChat();
@@ -470,19 +610,16 @@
         }
     }
 
-    function renderNotKBanner() {
+    function renderUnsupportedBanner() {
         $count.textContent = '0';
         $total.textContent = '';
         $filters.innerHTML = '';
-        const target = `https://web.telegram.org/k/${location.hash || ''}`;
         $list.innerHTML = `
             <div class="tge-empty">
-                <strong style="color:#e8e8e8;font-size:14px;">This needs Telegram Web K</strong><br><br>
-                The extractor reads the <code>/k/</code> DOM. Your session is shared,
-                the same chat opens there without logging in again.<br><br>
-                <a id="tge-to-k" href="${target}" style="color:#2481cc;font-weight:600;">
-                    → Open this chat in /k/
-                </a>
+                <strong style="color:#e8e8e8;font-size:14px;">Use Telegram Web K or A</strong><br><br>
+                Open <a href="https://web.telegram.org/k/">/k/</a> or
+                <a href="https://web.telegram.org/a/">/a/</a>, sign in there,
+                and open your chat. The two clients can require separate logins.
             </div>`;
     }
 
@@ -559,7 +696,8 @@
     }
 
     function findBubble(mid) {
-        return document.querySelector(`.bubble[data-mid="${mid}"]`);
+        return onA() ? aMessageList()?.querySelector(`.Message[data-message-id="${mid}"], #message-${mid}`)
+            : kMessageList()?.querySelector(`.bubble[data-mid="${mid}"], .bubble[data-mid="${mid + MESSAGE_ID_OFFSET}"]`);
     }
 
     function renderList() {
@@ -755,7 +893,7 @@
         if (!fromTelegram) return;
         clearTimeout(harvestDebounce);
         harvestDebounce = setTimeout(() => {
-            if (!onK()) return;
+            if (!supported()) return;
             if (harvest() > 0) renderSoon();
         }, 400);
     });
@@ -786,7 +924,7 @@
     }
 
     console.log(
-        `%c[Telegram Text Extractor v${VERSION}]%c K build loaded.`,
+        `%c[Telegram Text Extractor v${VERSION}]%c ${onK() ? 'K' : onA() ? 'A' : 'Unsupported'} build loaded.`,
         'color:#2481cc;font-weight:bold;font-size:14px',
         'color:inherit'
     );
